@@ -199,11 +199,16 @@ tid_t thread_create(const char *name, int priority,
   sf->eip = switch_entry;
   sf->ebp = 0;
 
-  intr_set_level(old_level);
-
   /* Add to run queue. */
   thread_unblock(t);
 
+  struct thread *cur;
+  cur = thread_current();
+
+  if (cur != idle_thread && cur->priority < t->priority)
+    thread_yield();
+
+  intr_set_level(old_level);
   return tid;
 }
 
@@ -219,6 +224,15 @@ void thread_block(void)
   ASSERT(intr_get_level() == INTR_OFF);
 
   thread_current()->status = PINTHR_BLOCKED;
+  schedule();
+}
+
+void thread_sleep(void)
+{
+  ASSERT(!intr_context());
+  ASSERT(intr_get_level() == INTR_OFF);
+
+  thread_current()->status = PINTHR_SLEEP;
   schedule();
 }
 
@@ -238,8 +252,23 @@ void thread_unblock(struct thread *t)
 
   old_level = intr_disable();
   ASSERT(t->status == PINTHR_BLOCKED);
-  list_ins_back(&ready_list, &t->elem);
+  list_insert_ordered(&ready_list, &t->elem, &comparator_priority, NULL);
   t->status = PINTHR_READY;
+
+  intr_set_level(old_level);
+}
+
+void thread_wakeup(struct thread *t)
+{
+  enum intr_level old_level;
+
+  ASSERT(is_thread(t));
+
+  old_level = intr_disable();
+  ASSERT(t->status == PINTHR_SLEEP);
+  list_insert_ordered(&ready_list, &t->elem, &comparator_priority, NULL);
+  t->status = PINTHR_READY;
+
   intr_set_level(old_level);
 }
 
@@ -306,7 +335,7 @@ void thread_yield(void)
 
   old_level = intr_disable();
   if (cur != idle_thread)
-    list_ins_back(&ready_list, &cur->elem);
+    list_insert_ordered(&ready_list, &cur->elem, &comparator_priority, NULL);
   cur->status = PINTHR_READY;
   schedule();
   intr_set_level(old_level);
@@ -331,7 +360,21 @@ void thread_foreach(thread_action_func *func, void *aux)
 /* Sets the current thread's priority to NEW_PRIORITY. */
 void thread_set_priority(int new_priority)
 {
+  // thread_current()->priority = new_priority;
+  enum intr_level old_level;
+  old_level = intr_disable();
+
+  thread_current()->old_priority = thread_current()->priority;
   thread_current()->priority = new_priority;
+
+  if (!list_empty(&ready_list))
+  {
+    struct thread *front = list_entry(list_front(&ready_list), struct thread, elem);
+    if (front->priority > thread_current()->priority)
+      thread_yield();
+  }
+
+  intr_set_level(old_level);
 }
 
 /* Returns the current thread's priority. */
@@ -442,6 +485,7 @@ is_thread(struct thread *t)
 static void
 init_thread(struct thread *t, const char *name, int priority)
 {
+  enum intr_level old_level;
   ASSERT(t != NULL);
   ASSERT(PRTY_MIN <= priority && priority <= PRTY_MAX);
   ASSERT(name != NULL);
@@ -452,7 +496,12 @@ init_thread(struct thread *t, const char *name, int priority)
   t->stack = (uint8_t *)t + PGSIZE;
   t->priority = priority;
   t->magic = PINTHR_MAGIC;
+
+  list_init(&t->donor_list);
+
+  old_level = intr_disable();
   list_ins_back(&all_list, &t->allelem);
+  intr_set_level(old_level);
 }
 
 /* Allocates a SIZE-byte frame at the top of thread T's stack and
@@ -567,3 +616,26 @@ allocate_tid(void)
 /* Offset of `stack' member within `struct thread'.
    Used by switch.S, which can't figure it out on its own. */
 uint32_t thread_stack_ofs = offsetof(struct thread, stack);
+
+/*Comparator used to insert threads in sleep_list in
+ascending order of their sleep ticks*/
+bool comparator_sleepticks(const struct list_elem *elem1, const struct list_elem *elem2, void *dum UNUSED)
+{
+  struct thread *t1 = list_entry(elem1, struct thread, elem);
+  struct thread *t2 = list_entry(elem2, struct thread, elem);
+  if (t1->sleep_ticks < t2->sleep_ticks)
+    return true;
+  return false;
+}
+
+/*Comparator used to insert threads based on
+priority in their respective queues*/
+
+bool comparator_priority(const struct list_elem *elem1, const struct list_elem *elem2, void *dum UNUSED)
+{
+  struct thread *t1 = list_entry(elem1, struct thread, elem);
+  struct thread *t2 = list_entry(elem2, struct thread, elem);
+  if (t1->priority > t2->priority)
+    return true;
+  return false;
+}
